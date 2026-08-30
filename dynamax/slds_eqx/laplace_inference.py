@@ -152,8 +152,17 @@ def laplace_approximation(log_prob,
 
 def fit_laplace_em(slds, key, emissions, initial_zs, initial_xs,
                     num_iters=100, n_discrete_samples=1, freeze_z = False, freeze_params = False,
-                    project_fn = None):
+                    project_fn = None, m_step_lr = 1e-3, m_step_iters = 10):
     """
+    m_step_lr / m_step_iters control the Adam M-step. They matter more than they
+    look: Adam moves each parameter by at most about the learning rate per step,
+    so a parameter can travel no further than roughly
+        num_iters * m_step_iters * m_step_lr
+    from its initialisation over the whole fit. With the old defaults
+    (10 EM iters x 10 Adam steps x 1e-3) that ceiling is 0.1, which silently
+    caps every parameter. If a fitted value sits exactly at that bound, the fit
+    ran out of optimiser rather than converging.
+
     Estimate the parameters of the SLDS and an approximate posterior distr.
     over latent states using Laplace EM. Specifically, the approximate
     posterior factors over discrete and continuous latent states. The
@@ -254,7 +263,7 @@ def fit_laplace_em(slds, key, emissions, initial_zs, initial_xs,
         
         # Conditionally skip the M-step(ECoG SLDS)
         if not freeze_params:
-            slds = _update_params(slds, ys, zs, xs, lr=1e-3, num_iters=10)
+            slds = _update_params(slds, ys, zs, xs, lr=m_step_lr, num_iters=m_step_iters)
 
         lp = vmap(slds.log_prob)(ys, zs, xs).sum()
         return (zs, xs, slds, key), lp
