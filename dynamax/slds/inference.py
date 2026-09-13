@@ -229,10 +229,13 @@ def rbpfilter(
                                                                                 weights, new_states, filtered_means, filtered_covs, next_key)
 
         # Build carry and output states
-        carry = (weights, prev_states, filtered_means, filtered_covs, next_key)
+        # new_states is what this step sampled, ran the KF on, weighted and
+        # resampled. Carrying prev_states instead pins the discrete chain to
+        # its initialization for the whole recording.
+        carry = (weights, new_states, filtered_means, filtered_covs, next_key)
         outputs = {
             "weights": weights,
-            "states": prev_states,
+            "states": new_states,
             "means": filtered_means,
             "covariances": filtered_covs
         }
