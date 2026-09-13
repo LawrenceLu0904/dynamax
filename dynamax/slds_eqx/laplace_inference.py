@@ -152,8 +152,14 @@ def laplace_approximation(log_prob,
 
 def fit_laplace_em(slds, key, emissions, initial_zs, initial_xs,
                     num_iters=100, n_discrete_samples=1, freeze_z = False, freeze_params = False,
-                    project_fn = None, m_step_lr = 1e-3, m_step_iters = 10):
+                    project_fn = None, m_step_lr = 1e-3, m_step_iters = 10,
+                    closed_form_dynamics = False):
     """
+    closed_form_dynamics: if True, the dynamics A_k, b_k and Q_k are replaced by
+    their exact maximiser after every Adam M-step -- weighted least squares from
+    the E-step's second moments, see _update_dynamics_closed_form. C, d, R and P
+    keep the Adam update. False keeps the original all-Adam M-step.
+
     m_step_lr / m_step_iters control the Adam M-step. They matter more than they
     look: Adam moves each parameter by at most about the learning rate per step,
     so a parameter can travel no further than roughly
@@ -230,6 +236,89 @@ def fit_laplace_em(slds, key, emissions, initial_zs, initial_xs,
 
         return Ex, ExxT, ExxnT, J_diag, J_lower_diag, h
 
+    def _update_dynamics_closed_form(slds, zs, Ex, ExxT, ExxnT, ridge=1e-4):
+        r"""
+        Exact M-step for the dynamics A_k, b_k and Q_k, as ssm does it.
+
+        Each state's dynamics x_{t+1} = A_k x_t + b_k + noise is a weighted least
+        squares problem over the transitions that state governs. The state that
+        governs x_t -> x_{t+1} is z_{t+1}, as in models.py::log_prob. With
+        u_t = [x_t; 1] and sums over those transitions:
+
+            [A_k  b_k] = ( sum_t E[x_{t+1} u_t^T] ) ( sum_t E[u_t u_t^T] )^-1
+            Q_k        = diag( sum_t E[x_{t+1} x_{t+1}^T]
+                               - [A_k  b_k] ( sum_t E[x_{t+1} u_t^T] )^T ) / N_k
+
+        The expectations use the Laplace posterior's second moments rather than
+        the outer product of its mean: x is inferred, E[x x^T] = x x^T + Cov, and
+        leaving out Cov biases A_k.
+
+        ExxnT[t] is E[x_{t+1} x_t^T]. The docstring of
+        block_tridiag_mvn_expectations describes its transpose; this was checked
+        against the exact covariance of a small block-tridiagonal system, and
+        using the transpose makes the fit diverge.
+        """
+        K = slds.num_states
+        D = slds.latent_dim
+
+        # weight[k, b, t] = 1 where state k governs transition t of sequence b
+        weight_list = []
+        for k in range(K):
+            weight_list.append((zs[:, 1:] == k).astype(jnp.float32))
+        weight = jnp.stack(weight_list)
+
+        # per state, summed over its transitions
+        S_xx_prev = jnp.einsum("kbt,btij->kij", weight, ExxT[:, :-1, :, :])  # E[x_t x_t^T]
+        S_xx_next = jnp.einsum("kbt,btij->kij", weight, ExxT[:, 1:, :, :])   # E[x_{t+1} x_{t+1}^T]
+        S_next_prev = jnp.einsum("kbt,btij->kij", weight, ExxnT)             # E[x_{t+1} x_t^T]
+        S_x_prev = jnp.einsum("kbt,bti->ki", weight, Ex[:, :-1, :])          # E[x_t]
+        S_x_next = jnp.einsum("kbt,bti->ki", weight, Ex[:, 1:, :])           # E[x_{t+1}]
+        N = jnp.einsum("kbt->k", weight)                                     # number of transitions
+
+        def _solve_one_state(s_xx_prev, s_xx_next, s_next_prev, s_x_prev, s_x_next, n):
+            """A_k, b_k and Q_k of one state, from its summed moments"""
+            # sum_t E[u_t u_t^T], with u_t = [x_t; 1]
+            uu = jnp.block([[s_xx_prev, s_x_prev[:, None]],
+                            [s_x_prev[None, :], n[None, None]]])
+            uu = uu + ridge * jnp.eye(D + 1)
+            # sum_t E[x_{t+1} u_t^T]
+            xu = jnp.concatenate([s_next_prev, s_x_next[:, None]], axis=1)
+            Ab = jnp.linalg.solve(uu.T, xu.T).T        # xu @ inverse(uu)
+            A_k = Ab[:, :D]
+            b_k = Ab[:, D]
+            residual = s_xx_next - Ab @ xu.T
+            # floored well above the Softplus offset (1e-5), where its inverse diverges
+            q_k = jnp.clip(jnp.diag(residual) / jnp.maximum(n, 1.0), 1e-4, None)
+            return A_k, b_k, q_k
+
+        As, bs, qs = vmap(_solve_one_state)(S_xx_prev, S_xx_next, S_next_prev,
+                                            S_x_prev, S_x_next, N)
+
+        # a state with too few transitions to solve for keeps its dynamics
+        has_data = (N > D + 1)[:, None, None]
+        As = jnp.where(has_data, As, slds.dynamics_matrices)
+        bs = jnp.where(has_data[:, :, 0], bs, slds.dynamics_biases)
+        qs_before = tfb.Softplus(low=1e-5).forward(slds.dynamics_diag_logvars)
+        qs = jnp.where(has_data[:, :, 0], qs, qs_before)
+        log_qs = tfb.Softplus(low=1e-5).inverse(qs)
+
+        def _dynamics_matrices(model):
+            """where the A_k live in the model, for eqx.tree_at"""
+            return model.dynamics_matrices
+
+        def _dynamics_biases(model):
+            """where the b_k live in the model, for eqx.tree_at"""
+            return model.dynamics_biases
+
+        def _dynamics_diag_logvars(model):
+            """where the Q_k live in the model (unconstrained), for eqx.tree_at"""
+            return model.dynamics_diag_logvars
+
+        slds = eqx.tree_at(_dynamics_matrices, slds, As)
+        slds = eqx.tree_at(_dynamics_biases, slds, bs)
+        slds = eqx.tree_at(_dynamics_diag_logvars, slds, log_qs)
+        return slds
+
     def _update_params(slds, ys, zs, xs, lr=1e-3, num_iters=10):
 
         def _objective(slds):
@@ -260,49 +349,35 @@ def fit_laplace_em(slds, key, emissions, initial_zs, initial_xs,
             key, skey = jr.split(key)
             post, x_samples = vmap(partial(_update_discrete_states, slds))(jr.split(skey, B), J_diag, J_lower_diag, h)
             zs = jnp.argmax(post.smoothed_probs, axis=-1)
-        
+
         # Conditionally skip the M-step(ECoG SLDS)
         if not freeze_params:
             slds = _update_params(slds, ys, zs, xs, lr=m_step_lr, num_iters=m_step_iters)
+            # Adam has just moved every parameter. The dynamics are then set to
+            # their exact maximiser, which replaces Adam's step on them only
+            if closed_form_dynamics:
+                slds = _update_dynamics_closed_form(slds, zs, Ex, ExxT, ExxnT)
 
         lp = vmap(slds.log_prob)(ys, zs, xs).sum()
         return (zs, xs, slds, key), lp
 
-    #----------- what we change for ECoG SLDS --------------------------------
+    # ECoG SLDS: a Python loop rather than lax.scan, so the constraint can be
+    # applied between EM iterations and progress can be shown
     from tqdm.auto import trange
 
-    initial_carry = (initial_zs, initial_xs, slds, key)
-    # frozen_transition_logits = slds.transition_logits  # save ARHMM's transition logits
-    carry = initial_carry
+    carry = (initial_zs, initial_xs, slds, key)
     lps_list = []
     for i in trange(num_iters, desc="Laplace-EM"):
         carry, lp = _step(carry, 1.0)
 
-        # For region-constrained C: project C back onto the {block + orthonormal} set
-        # after each EM iteration (constrained M-step = maximize Q, then project).
+        # a constrained M-step: maximize, then project back onto the constraint
         if project_fn is not None:
             zs_c, xs_c, slds_c, key_c = carry
             slds_c = project_fn(slds_c)
             carry = (zs_c, xs_c, slds_c, key_c)
 
-        # Restore frozen transition logits after each step
-        # zs_c, xs_c, slds_c, key_c = carry
-        # slds_c = eqx.tree_at(lambda s: s.transition_logits, slds_c, frozen_transition_logits)
-        # carry = (zs_c, xs_c, slds_c, key_c)
-
         lps_list.append(lp)
 
     zs, xs, slds, key = carry
     lps = jnp.array(lps_list)
-
-    #-------------------------------------------------------------------------
-
-    # initial_carry = (initial_zs, initial_xs, slds, key)
-    # step_sizes = jnp.ones((num_iters))
-    # (zs, xs, slds, key), lps = lax.scan(_step, initial_carry, step_sizes)
-
-    # carry = initial_carrys
-    # for i in range(num_iters):
-    #     carry, out = _step(carry, step_sizes[i])
-
     return slds, lps, zs, xs, key
