@@ -153,8 +153,13 @@ def laplace_approximation(log_prob,
 def fit_laplace_em(slds, key, emissions, initial_zs, initial_xs,
                     num_iters=100, n_discrete_samples=1, freeze_z = False, freeze_params = False,
                     project_fn = None, m_step_lr = 1e-3, m_step_iters = 10,
-                    closed_form_dynamics = False):
+                    closed_form_dynamics = False, return_m_step_losses = False):
     """
+    return_m_step_losses: if True, also return the Adam M-step's objective at
+    every one of its steps, (num_iters, m_step_iters), for a plot of whether
+    each M-step finished descending or ran out of steps. Default False keeps
+    the five-value return every existing caller expects.
+
     closed_form_dynamics: if True, the dynamics A_k, b_k and Q_k are replaced by
     their exact maximiser after every Adam M-step -- weighted least squares from
     the E-step's second moments, see _update_dynamics_closed_form. C, d, R and P
@@ -329,14 +334,16 @@ def fit_laplace_em(slds, key, emissions, initial_zs, initial_xs,
 
         def _step(carry, args):
             slds, opt_state = carry
-            grads = jax.grad(_objective)(slds)
+            loss, grads = jax.value_and_grad(_objective)(slds)
             updates, opt_state = optimizer.update(grads, opt_state)
             slds = optax.apply_updates(slds, updates)
-            return (slds, opt_state), None
+            return (slds, opt_state), loss
 
-        (slds, _), _ = lax.scan(_step, (slds, opt_state), None, length=num_iters)
+        (slds, _), losses = lax.scan(_step, (slds, opt_state), None, length=num_iters)
 
-        return slds
+        # losses[i] is the objective BEFORE step i, so a flat tail means Adam
+        # has stopped moving and num_iters was enough
+        return slds, losses
 
     def _step(carry, step_size):
         zs, xs, slds, key = carry
@@ -351,15 +358,17 @@ def fit_laplace_em(slds, key, emissions, initial_zs, initial_xs,
             zs = jnp.argmax(post.smoothed_probs, axis=-1)
 
         # Conditionally skip the M-step(ECoG SLDS)
+        m_losses = jnp.zeros(0)
         if not freeze_params:
-            slds = _update_params(slds, ys, zs, xs, lr=m_step_lr, num_iters=m_step_iters)
+            slds, m_losses = _update_params(slds, ys, zs, xs, lr=m_step_lr,
+                                            num_iters=m_step_iters)
             # Adam has just moved every parameter. The dynamics are then set to
             # their exact maximiser, which replaces Adam's step on them only
             if closed_form_dynamics:
                 slds = _update_dynamics_closed_form(slds, zs, Ex, ExxT, ExxnT)
 
         lp = vmap(slds.log_prob)(ys, zs, xs).sum()
-        return (zs, xs, slds, key), lp
+        return (zs, xs, slds, key), lp, m_losses
 
     # ECoG SLDS: a Python loop rather than lax.scan, so the constraint can be
     # applied between EM iterations and progress can be shown
@@ -367,8 +376,10 @@ def fit_laplace_em(slds, key, emissions, initial_zs, initial_xs,
 
     carry = (initial_zs, initial_xs, slds, key)
     lps_list = []
+    m_losses_list = []
     for i in trange(num_iters, desc="Laplace-EM"):
-        carry, lp = _step(carry, 1.0)
+        carry, lp, m_losses = _step(carry, 1.0)
+        m_losses_list.append(m_losses)
 
         # a constrained M-step: maximize, then project back onto the constraint
         if project_fn is not None:
@@ -380,4 +391,6 @@ def fit_laplace_em(slds, key, emissions, initial_zs, initial_xs,
 
     zs, xs, slds, key = carry
     lps = jnp.array(lps_list)
+    if return_m_step_losses:
+        return slds, lps, zs, xs, key, jnp.array(m_losses_list)
     return slds, lps, zs, xs, key
