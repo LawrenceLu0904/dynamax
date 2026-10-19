@@ -56,7 +56,7 @@ def laplace_approximation(log_prob,
         scale = initial_states.size
         dim = initial_states.shape[-1]
 
-        if method == "BFGS" or "L-BFGS":
+        if method in ("BFGS", "L-BFGS"):
             # scipy minimize expects x to be shape (n,) so we flatten / unflatten
             def _objective(x_flattened):
                 x = x_flattened.reshape(-1, dim)
@@ -80,7 +80,7 @@ def laplace_approximation(log_prob,
 
             @jit
             def step(params, opt_state):
-                loss_value, grads = value_and_grad(_objective)()
+                loss_value, grads = value_and_grad(_objective)(params)
                 updates, opt_state = optimizer.update(grads, opt_state, params)
                 params = optax.apply_updates(params, updates)
                 return params, opt_state, loss_value
@@ -91,7 +91,8 @@ def laplace_approximation(log_prob,
             x_mode = params
 
         else:
-            raise ValueError(f"method = {method} is not recognized. Should be one of ['Adam', 'BFGS']")
+            raise ValueError(f"method = {method} is not recognized. "
+                             f"Should be one of ['Adam', 'BFGS', 'L-BFGS']")
 
         return x_mode
 
@@ -153,7 +154,8 @@ def laplace_approximation(log_prob,
 def fit_laplace_em(slds, key, emissions, initial_zs, initial_xs,
                     num_iters=100, n_discrete_samples=1, freeze_z = False, freeze_params = False,
                     project_fn = None, m_step_lr = 1e-3, m_step_iters = 10,
-                    closed_form_dynamics = False, return_m_step_losses = False):
+                    closed_form_dynamics = False, return_m_step_losses = False,
+                    soft_responsibilities = False):
     """
     return_m_step_losses: if True, also return the Adam M-step's objective at
     every one of its steps, (num_iters, m_step_iters), for a plot of whether
@@ -241,7 +243,7 @@ def fit_laplace_em(slds, key, emissions, initial_zs, initial_xs,
 
         return Ex, ExxT, ExxnT, J_diag, J_lower_diag, h
 
-    def _update_dynamics_closed_form(slds, zs, Ex, ExxT, ExxnT, ridge=1e-4):
+    def _update_dynamics_closed_form(slds, zs, Ex, ExxT, ExxnT, ridge=1e-4, resp=None):
         r"""
         Exact M-step for the dynamics A_k, b_k and Q_k, as ssm does it.
 
@@ -266,11 +268,20 @@ def fit_laplace_em(slds, key, emissions, initial_zs, initial_xs,
         K = slds.num_states
         D = slds.latent_dim
 
-        # weight[k, b, t] = 1 where state k governs transition t of sequence b
-        weight_list = []
-        for k in range(K):
-            weight_list.append((zs[:, 1:] == k).astype(jnp.float32))
-        weight = jnp.stack(weight_list)
+        # weight[k, b, t]: how much of transition t of sequence b state k owns.
+        # resp is the smoothed posterior p(z_t = k), which is what the reference
+        # weights by -- ssm's observations.py m_step uses Ez for both the mean
+        # and the covariance. The argmax one-hot below is hard/Viterbi EM: it
+        # maximises the complete-data likelihood at the MAP z, a different
+        # objective with no monotonicity guarantee, and the log-prob does fall
+        # in 7-26 of 59 iterations in every subject (ECoG SLDS, 2026-10-09)
+        if resp is not None:
+            weight = jnp.transpose(resp[:, 1:, :], (2, 0, 1))
+        else:
+            weight_list = []
+            for k in range(K):
+                weight_list.append((zs[:, 1:] == k).astype(jnp.float32))
+            weight = jnp.stack(weight_list)
 
         # per state, summed over its transitions
         S_xx_prev = jnp.einsum("kbt,btij->kij", weight, ExxT[:, :-1, :, :])  # E[x_t x_t^T]
@@ -352,9 +363,11 @@ def fit_laplace_em(slds, key, emissions, initial_zs, initial_xs,
         xs = Ex # redefine xs as mean
 
         # For ECoG SLDS, Conditionally skip the z update:
+        resp = None
         if not freeze_z:
             key, skey = jr.split(key)
             post, x_samples = vmap(partial(_update_discrete_states, slds))(jr.split(skey, B), J_diag, J_lower_diag, h)
+            resp = post.smoothed_probs
             zs = jnp.argmax(post.smoothed_probs, axis=-1)
 
         # Conditionally skip the M-step(ECoG SLDS)
@@ -365,7 +378,9 @@ def fit_laplace_em(slds, key, emissions, initial_zs, initial_xs,
             # Adam has just moved every parameter. The dynamics are then set to
             # their exact maximiser, which replaces Adam's step on them only
             if closed_form_dynamics:
-                slds = _update_dynamics_closed_form(slds, zs, Ex, ExxT, ExxnT)
+                slds = _update_dynamics_closed_form(
+                    slds, zs, Ex, ExxT, ExxnT,
+                    resp = resp if soft_responsibilities else None)
 
         lp = vmap(slds.log_prob)(ys, zs, xs).sum()
         return (zs, xs, slds, key), lp, m_losses
