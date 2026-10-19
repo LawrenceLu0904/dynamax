@@ -24,6 +24,11 @@ class SLDS(eqx.Module):
     num_states : int = eqx.static_field()
     latent_dim : int = eqx.static_field()
     emission_dim : int = eqx.static_field()
+    # ECoG SLDS: extra Dirichlet concentration on each row's OWN state. The
+    # symmetric Dirichlet(1.1) below has its mode at the uniform row, so it
+    # pulls every self-transition toward 1/K; with sticky_kappa > 0 the
+    # diagonal is favoured instead and a state can hold. 0 keeps the old prior
+    sticky_kappa : float = eqx.static_field(default = 0.0)
 
     transition_logits : Float[Array, "num_states num_states-1"]
     dynamics_matrices : Float[Array, "num_states latent_dim latent_dim"] # For each state this is latent_dim x latent_dim
@@ -37,11 +42,13 @@ class SLDS(eqx.Module):
                  num_states : int,
                  latent_dim : int,
                  emission_dim : int,
-                 log_P, As, bs, log_Qs, C, d, log_R):
+                 log_P, As, bs, log_Qs, C, d, log_R,
+                 sticky_kappa : float = 0.0):
         # TODO: move parameter initialization to here
         self.num_states = num_states
         self.latent_dim = latent_dim
         self.emission_dim = emission_dim
+        self.sticky_kappa = sticky_kappa
 
         self.transition_logits = log_P
         self.dynamics_matrices = As
@@ -106,7 +113,12 @@ class SLDS(eqx.Module):
 
     def log_prob(self, ys, zs, xs):
         # prior
-        lp = tfd.Dirichlet(concentration=1.1*jnp.ones((self.num_states,))).log_prob(self.transition_matrix).sum()
+        # ECoG SLDS: a sticky Dirichlet. concentration[k] = 1.1 everywhere plus
+        # sticky_kappa on entry k, so row k's own state is favoured rather than
+        # the uniform row. sticky_kappa = 0 reproduces the previous prior exactly
+        concentration = 1.1 * jnp.ones((self.num_states, self.num_states))
+        concentration = concentration + self.sticky_kappa * jnp.eye(self.num_states)
+        lp = tfd.Dirichlet(concentration=concentration).log_prob(self.transition_matrix).sum()
 
         # TODO : add initial time point log prob
         # lp = self.init_discrete_state_distn().log_prob(zs[0])
